@@ -11,3 +11,6 @@ The baseline YOLOv8s model has been improved with the integration of Global Atte
 4. Additional changes to facilitate operations are present in: ultralytics/nn/tasks.py
 
 5. YAML source file: ultralytics/cfg/models/v8/yolov8-GAM-Attention.yaml
+
+
+Please reach out to me at arojsubedi@gmail.com if you need any help with this repository.
