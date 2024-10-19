@@ -1,4 +1,8 @@
 # Improved YOLOv8s Object Detection Algorithm
+
+Detailed explanation: 
+http://rave.ohiolink.edu/etdc/view?acc_num=ucin1712911943409436
+
 The baseline YOLOv8s model has been improved with the integration of Global Attention Mechanism (GAM), Modified Neck, and Wise Intersection over Union (WIoUv3).
 
 
