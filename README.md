@@ -1,7 +1,20 @@
 # Improved YOLOv8s Object Detection Algorithm
 
 Detailed explanation: 
-http://rave.ohiolink.edu/etdc/view?acc_num=ucin1712911943409436
+https://arxiv.org/abs/2412.14211
+
+BibTex Citation: 
+```
+@misc{subedi2024improvinggeneralizationperformanceyolov8,
+      title={Improving Generalization Performance of YOLOv8 for Camera Trap Object Detection}, 
+      author={Aroj Subedi},
+      year={2024},
+      eprint={2412.14211},
+      archivePrefix={arXiv},
+      primaryClass={cs.CV},
+      url={https://arxiv.org/abs/2412.14211}, 
+}
+```
 
 The baseline YOLOv8s model has been improved with the integration of Global Attention Mechanism (GAM), Modified Neck, and Wise Intersection over Union (WIoUv3).
 
