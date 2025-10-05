@@ -4,7 +4,8 @@ import torch
 import torch.nn as nn
 
 from .checks import check_version
-from .metrics import bbox_iou
+from .metrics import bbox_iou, probiou
+from .ops import xywhr2xyxyxyxy
 
 TORCH_1_10 = check_version(torch.__version__, '1.10.0')
 
@@ -245,6 +246,39 @@ class TaskAlignedAssigner(nn.Module):
 
         return target_labels, target_bboxes, target_scores
 
+class RotatedTaskAlignedAssigner(TaskAlignedAssigner):
+    def iou_calculation(self, gt_bboxes, pd_bboxes):
+        """IoU calculation for rotated bounding boxes."""
+        return probiou(gt_bboxes, pd_bboxes).squeeze(-1).clamp_(0)
+
+    @staticmethod
+    def select_candidates_in_gts(xy_centers, gt_bboxes):
+        """
+        Select the positive anchor center in gt for rotated bounding boxes.
+
+        Args:
+            xy_centers (Tensor): shape(h*w, 2)
+            gt_bboxes (Tensor): shape(b, n_boxes, 5)
+
+        Returns:
+            (Tensor): shape(b, n_boxes, h*w)
+        """
+        # (b, n_boxes, 5) --> (b, n_boxes, 4, 2)
+        corners = xywhr2xyxyxyxy(gt_bboxes)
+        # (b, n_boxes, 1, 2)
+        a, b, _, d = corners.split(1, dim=-2)
+        ab = b - a
+        ad = d - a
+
+        # (b, n_boxes, h*w, 2)
+        ap = xy_centers - a
+        norm_ab = (ab * ab).sum(dim=-1)
+        norm_ad = (ad * ad).sum(dim=-1)
+        ap_dot_ab = (ap * ab).sum(dim=-1)
+        ap_dot_ad = (ap * ad).sum(dim=-1)
+        return (ap_dot_ab >= 0) & (ap_dot_ab <= norm_ab) & (ap_dot_ad >= 0) & (ap_dot_ad <= norm_ad)  # is_in_box
+
+
 
 def make_anchors(feats, strides, grid_cell_offset=0.5):
     """Generate anchors from features."""
@@ -277,3 +311,22 @@ def bbox2dist(anchor_points, bbox, reg_max):
     """Transform bbox(xyxy) to dist(ltrb)."""
     x1y1, x2y2 = bbox.chunk(2, -1)
     return torch.cat((anchor_points - x1y1, x2y2 - anchor_points), -1).clamp_(0, reg_max - 0.01)  # dist (lt, rb)
+
+def dist2rbox(pred_dist, pred_angle, anchor_points, dim=-1):
+    """
+    Decode predicted object bounding box coordinates from anchor points and distribution.
+
+    Args:
+        pred_dist (torch.Tensor): Predicted rotated distance, (bs, h*w, 4).
+        pred_angle (torch.Tensor): Predicted angle, (bs, h*w, 1).
+        anchor_points (torch.Tensor): Anchor points, (h*w, 2).
+    Returns:
+        (torch.Tensor): Predicted rotated bounding boxes, (bs, h*w, 4).
+    """
+    lt, rb = pred_dist.split(2, dim=dim)
+    cos, sin = torch.cos(pred_angle), torch.sin(pred_angle)
+    # (bs, h*w, 1)
+    xf, yf = ((rb - lt) / 2).split(1, dim=dim)
+    x, y = xf * cos - yf * sin, xf * sin + yf * cos
+    xy = torch.cat([x, y], dim=dim) + anchor_points
+    return torch.cat([xy, lt + rb], dim=dim)

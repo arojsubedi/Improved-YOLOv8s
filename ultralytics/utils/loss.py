@@ -6,9 +6,9 @@ import torch.nn.functional as F
 
 from ultralytics.utils.metrics import OKS_SIGMA
 from ultralytics.utils.ops import crop_mask, xywh2xyxy, xyxy2xywh
-from ultralytics.utils.tal import TaskAlignedAssigner, dist2bbox, make_anchors
+from ultralytics.utils.tal import RotatedTaskAlignedAssigner, TaskAlignedAssigner, dist2bbox, dist2rbox, make_anchors
 
-from .metrics import bbox_iou
+from .metrics import bbox_iou, probiou
 from .tal import bbox2dist
 
 
@@ -533,3 +533,122 @@ class v8ClassificationLoss:
         loss = torch.nn.functional.cross_entropy(preds, batch['cls'], reduction='sum') / 64
         loss_items = loss.detach()
         return loss, loss_items
+
+class v8OBBLoss(v8DetectionLoss):
+    def __init__(self, model):
+        """
+        Initializes v8OBBLoss with model, assigner, and rotated bbox loss.
+
+        Note model must be de-paralleled.
+        """
+        super().__init__(model)
+        self.assigner = RotatedTaskAlignedAssigner(topk=10, num_classes=self.nc, alpha=0.5, beta=6.0)
+        self.bbox_loss = RotatedBboxLoss(self.reg_max - 1, use_dfl=self.use_dfl).to(self.device)
+
+    def preprocess(self, targets, batch_size, scale_tensor):
+        """Preprocesses the target counts and matches with the input batch size to output a tensor."""
+        if targets.shape[0] == 0:
+            out = torch.zeros(batch_size, 0, 6, device=self.device)
+        else:
+            i = targets[:, 0]  # image index
+            _, counts = i.unique(return_counts=True)
+            counts = counts.to(dtype=torch.int32)
+            out = torch.zeros(batch_size, counts.max(), 6, device=self.device)
+            for j in range(batch_size):
+                matches = i == j
+                n = matches.sum()
+                if n:
+                    bboxes = targets[matches, 2:]
+                    bboxes[..., :4].mul_(scale_tensor)
+                    out[j, :n] = torch.cat([targets[matches, 1:2], bboxes], dim=-1)
+        return out
+
+    def __call__(self, preds, batch):
+        """Calculate and return the loss for the YOLO model."""
+        loss = torch.zeros(3, device=self.device)  # box, cls, dfl
+        feats, pred_angle = preds if isinstance(preds[0], list) else preds[1]
+        batch_size = pred_angle.shape[0]  # batch size, number of masks, mask height, mask width
+        pred_distri, pred_scores = torch.cat([xi.view(feats[0].shape[0], self.no, -1) for xi in feats], 2).split(
+            (self.reg_max * 4, self.nc), 1
+        )
+
+        # b, grids, ..
+        pred_scores = pred_scores.permute(0, 2, 1).contiguous()
+        pred_distri = pred_distri.permute(0, 2, 1).contiguous()
+        pred_angle = pred_angle.permute(0, 2, 1).contiguous()
+
+        dtype = pred_scores.dtype
+        imgsz = torch.tensor(feats[0].shape[2:], device=self.device, dtype=dtype) * self.stride[0]  # image size (h,w)
+        anchor_points, stride_tensor = make_anchors(feats, self.stride, 0.5)
+
+        # targets
+        try:
+            batch_idx = batch["batch_idx"].view(-1, 1)
+            targets = torch.cat((batch_idx, batch["cls"].view(-1, 1), batch["bboxes"].view(-1, 5)), 1)
+            rw, rh = targets[:, 4] * imgsz[0].item(), targets[:, 5] * imgsz[1].item()
+            targets = targets[(rw >= 2) & (rh >= 2)]  # filter rboxes of tiny size to stabilize training
+            targets = self.preprocess(targets.to(self.device), batch_size, scale_tensor=imgsz[[1, 0, 1, 0]])
+            gt_labels, gt_bboxes = targets.split((1, 5), 2)  # cls, xywhr
+            mask_gt = gt_bboxes.sum(2, keepdim=True).gt_(0)
+        except RuntimeError as e:
+            raise TypeError(
+                "ERROR ❌ OBB dataset incorrectly formatted or not a OBB dataset.\n"
+                "This error can occur when incorrectly training a 'OBB' model on a 'detect' dataset, "
+                "i.e. 'yolo train model=yolov8n-obb.pt data=dota8.yaml'.\nVerify your dataset is a "
+                "correctly formatted 'OBB' dataset using 'data=dota8.yaml' "
+                "as an example.\nSee https://docs.ultralytics.com/datasets/obb/ for help."
+            ) from e
+
+        # Pboxes
+        pred_bboxes = self.bbox_decode(anchor_points, pred_distri, pred_angle)  # xyxy, (b, h*w, 4)
+
+        bboxes_for_assigner = pred_bboxes.clone().detach()
+        # Only the first four elements need to be scaled
+        bboxes_for_assigner[..., :4] *= stride_tensor
+        _, target_bboxes, target_scores, fg_mask, _ = self.assigner(
+            pred_scores.detach().sigmoid(),
+            bboxes_for_assigner.type(gt_bboxes.dtype),
+            anchor_points * stride_tensor,
+            gt_labels,
+            gt_bboxes,
+            mask_gt,
+        )
+
+        target_scores_sum = max(target_scores.sum(), 1)
+
+        # Cls loss
+        # loss[1] = self.varifocal_loss(pred_scores, target_scores, target_labels) / target_scores_sum  # VFL way
+        loss[1] = self.bce(pred_scores, target_scores.to(dtype)).sum() / target_scores_sum  # BCE
+
+        # Bbox loss
+        if fg_mask.sum():
+            target_bboxes[..., :4] /= stride_tensor
+            loss[0], loss[2] = self.bbox_loss(
+                pred_distri, pred_bboxes, anchor_points, target_bboxes, target_scores, target_scores_sum, fg_mask
+            )
+        else:
+            loss[0] += (pred_angle * 0).sum()
+
+        loss[0] *= self.hyp.box  # box gain
+        loss[1] *= self.hyp.cls  # cls gain
+        loss[2] *= self.hyp.dfl  # dfl gain
+
+        return loss.sum() * batch_size, loss.detach()  # loss(box, cls, dfl)
+
+    def bbox_decode(self, anchor_points, pred_dist, pred_angle):
+        """
+        Decode predicted object bounding box coordinates from anchor points and distribution.
+
+        Args:
+            anchor_points (torch.Tensor): Anchor points, (h*w, 2).
+            pred_dist (torch.Tensor): Predicted rotated distance, (bs, h*w, 4).
+            pred_angle (torch.Tensor): Predicted angle, (bs, h*w, 1).
+
+        Returns:
+            (torch.Tensor): Predicted rotated bounding boxes with angles, (bs, h*w, 5).
+        """
+        if self.use_dfl:
+            b, a, c = pred_dist.shape  # batch, anchors, channels
+            pred_dist = pred_dist.view(b, a, 4, c // 4).softmax(3).matmul(self.proj.type(pred_dist.dtype))
+        return torch.cat((dist2rbox(pred_dist, pred_angle, anchor_points), pred_angle), dim=-1)
+    

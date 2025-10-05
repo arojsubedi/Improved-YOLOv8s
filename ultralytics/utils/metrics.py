@@ -208,6 +208,99 @@ def kpt_iou(kpt1, kpt2, area, sigma, eps=1e-7):
     return (torch.exp(-e) * kpt_mask[:, None]).sum(-1) / (kpt_mask.sum(-1)[:, None] + eps)
 
 
+def _get_covariance_matrix(boxes):
+    """
+    Generating covariance matrix from obbs.
+
+    Args:
+        boxes (torch.Tensor): A tensor of shape (N, 5) representing rotated bounding boxes, with xywhr format.
+
+    Returns:
+        (torch.Tensor): Covariance metrixs corresponding to original rotated bounding boxes.
+    """
+    # Gaussian bounding boxes, ignore the center points (the first two columns) because they are not needed here.
+    gbbs = torch.cat((boxes[:, 2:4].pow(2) / 12, boxes[:, 4:]), dim=-1)
+    a, b, c = gbbs.split(1, dim=-1)
+    cos = c.cos()
+    sin = c.sin()
+    cos2 = cos.pow(2)
+    sin2 = sin.pow(2)
+    return a * cos2 + b * sin2, a * sin2 + b * cos2, (a - b) * cos * sin
+
+
+def probiou(obb1, obb2, CIoU=False, eps=1e-7):
+    """
+    Calculate the prob IoU between oriented bounding boxes, https://arxiv.org/pdf/2106.06072v1.pdf.
+
+    Args:
+        obb1 (torch.Tensor): A tensor of shape (N, 5) representing ground truth obbs, with xywhr format.
+        obb2 (torch.Tensor): A tensor of shape (N, 5) representing predicted obbs, with xywhr format.
+        eps (float, optional): A small value to avoid division by zero. Defaults to 1e-7.
+
+    Returns:
+        (torch.Tensor): A tensor of shape (N, ) representing obb similarities.
+    """
+    x1, y1 = obb1[..., :2].split(1, dim=-1)
+    x2, y2 = obb2[..., :2].split(1, dim=-1)
+    a1, b1, c1 = _get_covariance_matrix(obb1)
+    a2, b2, c2 = _get_covariance_matrix(obb2)
+
+    t1 = (
+        ((a1 + a2) * (y1 - y2).pow(2) + (b1 + b2) * (x1 - x2).pow(2)) / ((a1 + a2) * (b1 + b2) - (c1 + c2).pow(2) + eps)
+    ) * 0.25
+    t2 = (((c1 + c2) * (x2 - x1) * (y1 - y2)) / ((a1 + a2) * (b1 + b2) - (c1 + c2).pow(2) + eps)) * 0.5
+    t3 = (
+        ((a1 + a2) * (b1 + b2) - (c1 + c2).pow(2))
+        / (4 * ((a1 * b1 - c1.pow(2)).clamp_(0) * (a2 * b2 - c2.pow(2)).clamp_(0)).sqrt() + eps)
+        + eps
+    ).log() * 0.5
+    bd = (t1 + t2 + t3).clamp(eps, 100.0)
+    hd = (1.0 - (-bd).exp() + eps).sqrt()
+    iou = 1 - hd
+    if CIoU:  # only include the wh aspect ratio part
+        w1, h1 = obb1[..., 2:4].split(1, dim=-1)
+        w2, h2 = obb2[..., 2:4].split(1, dim=-1)
+        v = (4 / math.pi**2) * ((w2 / h2).atan() - (w1 / h1).atan()).pow(2)
+        with torch.no_grad():
+            alpha = v / (v - iou + (1 + eps))
+        return iou - v * alpha  # CIoU
+    return iou
+
+
+def batch_probiou(obb1, obb2, eps=1e-7):
+    """
+    Calculate the prob IoU between oriented bounding boxes, https://arxiv.org/pdf/2106.06072v1.pdf.
+
+    Args:
+        obb1 (torch.Tensor | np.ndarray): A tensor of shape (N, 5) representing ground truth obbs, with xywhr format.
+        obb2 (torch.Tensor | np.ndarray): A tensor of shape (M, 5) representing predicted obbs, with xywhr format.
+        eps (float, optional): A small value to avoid division by zero. Defaults to 1e-7.
+
+    Returns:
+        (torch.Tensor): A tensor of shape (N, M) representing obb similarities.
+    """
+    obb1 = torch.from_numpy(obb1) if isinstance(obb1, np.ndarray) else obb1
+    obb2 = torch.from_numpy(obb2) if isinstance(obb2, np.ndarray) else obb2
+
+    x1, y1 = obb1[..., :2].split(1, dim=-1)
+    x2, y2 = (x.squeeze(-1)[None] for x in obb2[..., :2].split(1, dim=-1))
+    a1, b1, c1 = _get_covariance_matrix(obb1)
+    a2, b2, c2 = (x.squeeze(-1)[None] for x in _get_covariance_matrix(obb2))
+
+    t1 = (
+        ((a1 + a2) * (y1 - y2).pow(2) + (b1 + b2) * (x1 - x2).pow(2)) / ((a1 + a2) * (b1 + b2) - (c1 + c2).pow(2) + eps)
+    ) * 0.25
+    t2 = (((c1 + c2) * (x2 - x1) * (y1 - y2)) / ((a1 + a2) * (b1 + b2) - (c1 + c2).pow(2) + eps)) * 0.5
+    t3 = (
+        ((a1 + a2) * (b1 + b2) - (c1 + c2).pow(2))
+        / (4 * ((a1 * b1 - c1.pow(2)).clamp_(0) * (a2 * b2 - c2.pow(2)).clamp_(0)).sqrt() + eps)
+        + eps
+    ).log() * 0.5
+    bd = (t1 + t2 + t3).clamp(eps, 100.0)
+    hd = (1.0 - (-bd).exp() + eps).sqrt()
+    return 1 - hd
+
+
 def smooth_BCE(eps=0.1):
     """
     Computes smoothed positive and negative Binary Cross-Entropy targets.
@@ -230,18 +323,18 @@ class ConfusionMatrix:
 
     Attributes:
         task (str): The type of task, either 'detect' or 'classify'.
-        matrix (np.array): The confusion matrix, with dimensions depending on the task.
+        matrix (np.ndarray): The confusion matrix, with dimensions depending on the task.
         nc (int): The number of classes.
         conf (float): The confidence threshold for detections.
         iou_thres (float): The Intersection over Union threshold.
     """
 
-    def __init__(self, nc, conf=0.25, iou_thres=0.45, task='detect'):
+    def __init__(self, nc, conf=0.25, iou_thres=0.45, task="detect"):
         """Initialize attributes for the YOLO model."""
         self.task = task
-        self.matrix = np.zeros((nc + 1, nc + 1)) if self.task == 'detect' else np.zeros((nc, nc))
+        self.matrix = np.zeros((nc + 1, nc + 1)) if self.task == "detect" else np.zeros((nc, nc))
         self.nc = nc  # number of classes
-        self.conf = 0.25 if conf in (None, 0.001) else conf  # apply 0.25 if default val conf is passed
+        self.conf = 0.25 if conf in {None, 0.001} else conf  # apply 0.25 if default val conf is passed
         self.iou_thres = iou_thres
 
     def process_cls_preds(self, preds, targets):
@@ -256,26 +349,39 @@ class ConfusionMatrix:
         for p, t in zip(preds.cpu().numpy(), targets.cpu().numpy()):
             self.matrix[p][t] += 1
 
-    def process_batch(self, detections, labels):
+    def process_batch(self, detections, gt_bboxes, gt_cls):
         """
         Update confusion matrix for object detection task.
 
         Args:
-            detections (Array[N, 6]): Detected bounding boxes and their associated information.
-                                      Each row should contain (x1, y1, x2, y2, conf, class).
-            labels (Array[M, 5]): Ground truth bounding boxes and their associated class labels.
-                                  Each row should contain (class, x1, y1, x2, y2).
+            detections (Array[N, 6] | Array[N, 7]): Detected bounding boxes and their associated information.
+                                      Each row should contain (x1, y1, x2, y2, conf, class)
+                                      or with an additional element `angle` when it's obb.
+            gt_bboxes (Array[M, 4]| Array[N, 5]): Ground truth bounding boxes with xyxy/xyxyr format.
+            gt_cls (Array[M]): The class labels.
         """
+        if gt_cls.shape[0] == 0:  # Check if labels is empty
+            if detections is not None:
+                detections = detections[detections[:, 4] > self.conf]
+                detection_classes = detections[:, 5].int()
+                for dc in detection_classes:
+                    self.matrix[dc, self.nc] += 1  # false positives
+            return
         if detections is None:
-            gt_classes = labels.int()
+            gt_classes = gt_cls.int()
             for gc in gt_classes:
                 self.matrix[self.nc, gc] += 1  # background FN
             return
 
         detections = detections[detections[:, 4] > self.conf]
-        gt_classes = labels[:, 0].int()
+        gt_classes = gt_cls.int()
         detection_classes = detections[:, 5].int()
-        iou = box_iou(labels[:, 1:], detections[:, :4])
+        is_obb = detections.shape[1] == 7 and gt_bboxes.shape[1] == 5  # with additional `angle` dimension
+        iou = (
+            batch_probiou(gt_bboxes, torch.cat([detections[:, :4], detections[:, -1:]], dim=-1))
+            if is_obb
+            else box_iou(gt_bboxes, detections[:, :4])
+        )
 
         x = torch.where(iou > self.iou_thres)
         if x[0].shape[0]:
@@ -311,11 +417,11 @@ class ConfusionMatrix:
         tp = self.matrix.diagonal()  # true positives
         fp = self.matrix.sum(1) - tp  # false positives
         # fn = self.matrix.sum(0) - tp  # false negatives (missed detections)
-        return (tp[:-1], fp[:-1]) if self.task == 'detect' else (tp, fp)  # remove background class if task=detect
+        return (tp[:-1], fp[:-1]) if self.task == "detect" else (tp, fp)  # remove background class if task=detect
 
-    @TryExcept('WARNING ⚠️ ConfusionMatrix plot failure')
+    @TryExcept("WARNING ⚠️ ConfusionMatrix plot failure")
     @plt_settings()
-    def plot(self, normalize=True, save_dir='', names=(), on_plot=None):
+    def plot(self, normalize=True, save_dir="", names=(), on_plot=None):
         """
         Plot the confusion matrix using seaborn and save it to a file.
 
@@ -325,32 +431,33 @@ class ConfusionMatrix:
             names (tuple): Names of classes, used as labels on the plot.
             on_plot (func): An optional callback to pass plots path and data when they are rendered.
         """
-        import seaborn as sn
+        import seaborn  # scope for faster 'import ultralytics'
 
-        array = self.matrix / ((self.matrix.sum(0).reshape(1, -1) + 1E-9) if normalize else 1)  # normalize columns
+        array = self.matrix / ((self.matrix.sum(0).reshape(1, -1) + 1e-9) if normalize else 1)  # normalize columns
         array[array < 0.005] = np.nan  # don't annotate (would appear as 0.00)
 
         fig, ax = plt.subplots(1, 1, figsize=(12, 9), tight_layout=True)
         nc, nn = self.nc, len(names)  # number of classes, names
-        sn.set(font_scale=1.0 if nc < 50 else 0.8)  # for label size
+        seaborn.set_theme(font_scale=1.0 if nc < 50 else 0.8)  # for label size
         labels = (0 < nn < 99) and (nn == nc)  # apply names to ticklabels
-        ticklabels = (list(names) + ['background']) if labels else 'auto'
+        ticklabels = (list(names) + ["background"]) if labels else "auto"
         with warnings.catch_warnings():
-            warnings.simplefilter('ignore')  # suppress empty matrix RuntimeWarning: All-NaN slice encountered
-            sn.heatmap(array,
-                       ax=ax,
-                       annot=nc < 30,
-                       annot_kws={
-                           'size': 8},
-                       cmap='Blues',
-                       fmt='.2f' if normalize else '.0f',
-                       square=True,
-                       vmin=0.0,
-                       xticklabels=ticklabels,
-                       yticklabels=ticklabels).set_facecolor((1, 1, 1))
-        title = 'Confusion Matrix' + ' Normalized' * normalize
-        ax.set_xlabel('True')
-        ax.set_ylabel('Predicted')
+            warnings.simplefilter("ignore")  # suppress empty matrix RuntimeWarning: All-NaN slice encountered
+            seaborn.heatmap(
+                array,
+                ax=ax,
+                annot=nc < 30,
+                annot_kws={"size": 8},
+                cmap="Blues",
+                fmt=".2f" if normalize else ".0f",
+                square=True,
+                vmin=0.0,
+                xticklabels=ticklabels,
+                yticklabels=ticklabels,
+            ).set_facecolor((1, 1, 1))
+        title = "Confusion Matrix" + " Normalized" * normalize
+        ax.set_xlabel("True")
+        ax.set_ylabel("Predicted")
         ax.set_title(title)
         plot_fname = Path(save_dir) / f'{title.lower().replace(" ", "_")}.png'
         fig.savefig(plot_fname, dpi=250)
@@ -361,7 +468,7 @@ class ConfusionMatrix:
     def print(self):
         """Print the confusion matrix to the console."""
         for i in range(self.nc + 1):
-            LOGGER.info(' '.join(map(str, self.matrix[i])))
+            LOGGER.info(" ".join(map(str, self.matrix[i])))
 
 
 def smooth(y, f=0.05):
@@ -1093,6 +1200,73 @@ class ClassifyMetrics(SimpleClass):
     def keys(self):
         """Returns a list of keys for the results_dict property."""
         return ['metrics/accuracy_top1', 'metrics/accuracy_top5']
+
+    @property
+    def curves(self):
+        """Returns a list of curves for accessing specific metrics curves."""
+        return []
+
+    @property
+    def curves_results(self):
+        """Returns a list of curves for accessing specific metrics curves."""
+        return []
+
+class OBBMetrics(SimpleClass):
+    def __init__(self, save_dir=Path("."), plot=False, on_plot=None, names=()) -> None:
+        self.save_dir = save_dir
+        self.plot = plot
+        self.on_plot = on_plot
+        self.names = names
+        self.box = Metric()
+        self.speed = {"preprocess": 0.0, "inference": 0.0, "loss": 0.0, "postprocess": 0.0}
+
+    def process(self, tp, conf, pred_cls, target_cls):
+        """Process predicted results for object detection and update metrics."""
+        results = ap_per_class(
+            tp,
+            conf,
+            pred_cls,
+            target_cls,
+            plot=self.plot,
+            save_dir=self.save_dir,
+            names=self.names,
+            on_plot=self.on_plot,
+        )[2:]
+        self.box.nc = len(self.names)
+        self.box.update(results)
+
+    @property
+    def keys(self):
+        """Returns a list of keys for accessing specific metrics."""
+        return ["metrics/precision(B)", "metrics/recall(B)", "metrics/mAP50(B)", "metrics/mAP50-95(B)"]
+
+    def mean_results(self):
+        """Calculate mean of detected objects & return precision, recall, mAP50, and mAP50-95."""
+        return self.box.mean_results()
+
+    def class_result(self, i):
+        """Return the result of evaluating the performance of an object detection model on a specific class."""
+        return self.box.class_result(i)
+
+    @property
+    def maps(self):
+        """Returns mean Average Precision (mAP) scores per class."""
+        return self.box.maps
+
+    @property
+    def fitness(self):
+        """Returns the fitness of box object."""
+        return self.box.fitness()
+
+    @property
+    def ap_class_index(self):
+        """Returns the average precision index per class."""
+        return self.box.ap_class_index
+
+    @property
+    def results_dict(self):
+        """Returns dictionary of computed performance metrics and statistics."""
+        return dict(zip(self.keys + ["fitness"], self.mean_results() + [self.fitness]))
 
     @property
     def curves(self):
