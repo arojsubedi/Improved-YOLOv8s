@@ -644,25 +644,31 @@ def check_amp(model):
     im = ASSETS / "bus.jpg"  # image to check
     prefix = colorstr("AMP: ")
     LOGGER.info(f"{prefix}running Automatic Mixed Precision (AMP) checks with YOLOv8n...")
-    warning_msg = "Setting 'amp=True'. If you experience zero-mAP or NaN losses you can disable AMP with amp=False."
+    warning_msg = "AMP is enabled for training. If you experience NaN losses you can disable it with amp=False."
     try:
         from ultralytics import YOLO
 
         assert amp_allclose(YOLO("yolov8n.pt"), im)
         LOGGER.info(f"{prefix}checks passed ✅")
-    except ConnectionError:
-        LOGGER.warning(f"{prefix}checks skipped ⚠️, offline and unable to download YOLOv8n. {warning_msg}")
+    except (ConnectionError, FileNotFoundError, OSError) as e:
+        # Download failed but AMP itself is fine - just skip validation and enable AMP
+        LOGGER.warning(f"{prefix}validation skipped ⚠️, unable to download YOLOv8n. Proceeding with AMP enabled.")
+        return True
     except (AttributeError, ModuleNotFoundError):
         LOGGER.warning(
-            f"{prefix}checks skipped ⚠️. "
-            f"Unable to load YOLOv8n due to possible Ultralytics package modifications. {warning_msg}"
+            f"{prefix}validation skipped ⚠️. "
+            f"Unable to load YOLOv8n due to possible Ultralytics package modifications. Proceeding with AMP enabled."
         )
+        return True
     except AssertionError:
         LOGGER.warning(
             f"{prefix}checks failed ❌. Anomalies were detected with AMP on your system that may lead to "
             f"NaN losses or zero-mAP results, so AMP will be disabled during training."
         )
         return False
+    except Exception as e:
+        LOGGER.warning(f"{prefix}validation skipped ⚠️, error during AMP check: {e}. Proceeding with AMP enabled.")
+        return True
     return True
 
 

@@ -708,6 +708,9 @@ def torch_safe_load(weight):
         ):  # for legacy 8.0 Classify and Pose models
             ckpt = torch.load(file, map_location="cpu")
 
+    except FileNotFoundError:
+        raise FileNotFoundError(f"Model file not found: {file}. The download may have failed. Try using 'amp=False' during training.")
+    
     except ModuleNotFoundError as e:  # e.name is missing module name
         if e.name == "models":
             raise TypeError(
